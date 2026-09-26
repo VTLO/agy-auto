@@ -37,6 +37,48 @@ max_tokens = 160
 # fail-closed: classifier error/timeout -> "deny" (force_ask is a no-op on 1.1.27)
 on_error = "deny"
 
+[router]
+# Optional: engine/router.py is a standalone local OpenAI-compatible endpoint that
+# sits in front of several real backends. It is NOT started automatically -- run
+# `python3 engine/router.py` and point [classifier].endpoint above at
+# "http://127.0.0.1:8080/v1/chat/completions" to use it. It does not make
+# allow/deny decisions itself (engine/policy.py's Engine still owns that); it only
+# decides, per pending tool call, which configured backend answers the
+# classifier's allow/deny/ask question this time -- e.g. routing anything that
+# touches network/cloud/deploy tools to a stronger cloud model while everything
+# else goes to a fast local model.
+listen_host = "127.0.0.1"
+listen_port = 8080
+# Backend used when no [[router.rules]] entry matches.
+default_backend = "local"
+# Backend retried once if the chosen backend is unreachable or times out.
+fallback_backend = "cloud"
+
+[router.backends.local]
+# Ollama by default; for a llama.cpp server instead use
+# endpoint = "http://127.0.0.1:8081/v1/chat/completions" (pick a port other than
+# this router's own 8080) and model = "".
+endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+model = "qwen2.5-coder:7b"
+timeout_s = 20
+
+[router.backends.cloud]
+endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+model = "gemini-3.5-flash-lite"
+api_key_env = "GEMINI_API_KEY"
+timeout_s = 15
+
+# First matching rule wins (match_tool: exact tool name; match_command: regex over
+# "<tool> <command>", case-insensitive; a rule with neither always matches).
+# Falls through to default_backend if nothing matches.
+[[router.rules]]
+match_command = "(?i)\\b(sudo|curl|wget|ssh|scp|rsync|nc|ncat|socat|docker|podman|kubectl|helm|aws|gcloud|az|terraform|tofu|pulumi|git\\s+push|npm\\s+publish)\\b"
+backend = "cloud"
+
+[[router.rules]]
+match_tool = "write_to_file"
+backend = "cloud"
+
 [cache]
 ttl_hours = 24
 dir = "~/.gemini/config/agy-auto/state"

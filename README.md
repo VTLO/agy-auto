@@ -203,6 +203,68 @@ timeout_s = 5
 ```
 
 
+## Routing the classifier across multiple backends (`engine/router.py`)
+
+If you want different tool calls to go to different models -- e.g. a fast local model
+for everyday commands, escalating to a stronger cloud model only for the calls that
+touch network/cloud/deploy tools -- run the built-in router instead of pointing
+`[classifier].endpoint` directly at one backend.
+
+`engine/router.py` is a small stdlib-only OpenAI-compatible server. It does **not**
+make the allow/deny call itself (`engine/policy.py`'s `Engine` still owns that); it
+only looks at the pending tool call the classifier is asking about and decides
+*which configured backend* answers this time, then relays that backend's response
+back untouched. If the chosen backend is unreachable or times out, it retries once
+against `router.fallback_backend`.
+
+```bash
+python3 engine/router.py                     # listens on 127.0.0.1:8080 by default
+python3 engine/router.py --host 0.0.0.0 --port 8888
+```
+
+Then point the classifier at it in `~/.gemini/config/agy-auto/policy.toml`:
+
+```toml
+[classifier]
+endpoint = "http://127.0.0.1:8080/v1/chat/completions"
+```
+
+Configure the backends and routing rules under `[router]` (shipped defaults are in
+`policy/default.toml`, mergeable the same way as any other policy layer):
+
+```toml
+[router]
+listen_host = "127.0.0.1"
+listen_port = 8080
+default_backend = "local"      # used when no [[router.rules]] entry matches
+fallback_backend = "cloud"     # retried once if the chosen backend fails
+
+[router.backends.local]
+endpoint = "http://127.0.0.1:11434/v1/chat/completions"   # Ollama
+model = "qwen2.5-coder:7b"
+timeout_s = 20
+
+[router.backends.cloud]
+endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+model = "gemini-3.5-flash-lite"
+api_key_env = "GEMINI_API_KEY"
+timeout_s = 15
+
+# First matching rule wins. match_tool: exact tool name. match_command: regex over
+# "<tool> <command>", case-insensitive. A rule with neither field always matches.
+[[router.rules]]
+match_command = "(?i)\\b(sudo|curl|wget|ssh|docker|kubectl|aws|gcloud|az|terraform|git\\s+push)\\b"
+backend = "cloud"
+
+[[router.rules]]
+match_tool = "write_to_file"
+backend = "cloud"
+```
+
+`GET /healthz` reports which backends are configured. Run
+`python3 -m unittest -v tests/test_router.py` to exercise the routing rules and the
+fallback path end-to-end against dummy loopback backends (no network, no agy).
+
 ## Running without a classifier (Deterministic Mode)
 
 You do **not** need a running LLM endpoint to use `agy-auto`:
@@ -243,6 +305,7 @@ what was decided and why.
 ```bash
 python3 -m unittest -v tests/test_engine.py   # corpus + parser + cache/escalation/fail-closed, no agy
 python3 -m unittest -v tests/test_bypasses.py # adversarial bypasses: self-protection, ambient leaks, TOCTOU
+python3 -m unittest -v tests/test_router.py   # multi-backend router: rule matching + fallback, loopback only
 tests/e2e.sh                                  # real agy: destructive command blocked, benign one runs
 tests/verify-harness.sh                       # Phase 0 checks again, after an agy upgrade
 ```
