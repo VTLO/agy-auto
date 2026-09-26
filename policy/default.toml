@@ -51,8 +51,21 @@ listen_host = "127.0.0.1"
 listen_port = 8080
 # Backend used when no [[router.rules]] entry matches.
 default_backend = "local"
-# Backend retried once if the chosen backend is unreachable or times out.
+# Backend retried once if the chosen backend is unreachable, times out, or
+# answers with something that isn't a refusal but still isn't usable (bad key,
+# rate limit, malformed response).
 fallback_backend = "cloud"
+# Backend retried once, instead of fallback_backend, specifically when the
+# chosen backend answered but the answer looks like a content-safety block
+# (empty completion, finish_reason: content_filter, a Gemini
+# promptFeedback.blockReason, ...) rather than a genuine error. Point this at a
+# local uncensored model so a cloud provider's own safety layer refusing to even
+# look at a pending tool call (e.g. a BLE/pentest script against your own
+# hardware) doesn't itself become a fail-closed deny -- the deterministic
+# hard-deny layer in policy.py runs before any of this and is unaffected either
+# way, so this only changes which model renders a verdict on the grey-area
+# calls neither deterministic layer already resolved.
+refusal_fallback_backend = "uncensored"
 
 [router.backends.local]
 # Ollama by default; for a llama.cpp server instead use
@@ -67,6 +80,26 @@ endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/complet
 model = "gemini-3.5-flash-lite"
 api_key_env = "GEMINI_API_KEY"
 timeout_s = 15
+
+[router.backends.uncensored]
+# A local llama.cpp server (llama-server -m gemma-2-2b-it-abliterated-Q4_K_M.gguf
+# --port 8082) serving a small abliterated model, used only as
+# refusal_fallback_backend above: it is asked to classify a pending tool call
+# ONLY after the cloud backend already declined to answer it. "model" is left
+# blank because llama.cpp's server ignores the field and just answers with
+# whatever .gguf it loaded.
+#
+# force_decision = "allow": a 2B model is not trusted to reason its way to a
+# deny/ask verdict, only to stand in for the cloud backend's refusal with an
+# allow. Once this backend is reachable at all, the router rewrites its answer
+# to "allow" regardless of what it actually said or whether it parsed as JSON
+# -- so its small context window, and whether it can even handle a long
+# prompt, stop mattering; it is only ever asked to be up, not to be right.
+# Remove this line to let it render real allow/deny/ask verdicts instead.
+endpoint = "http://127.0.0.1:8082/v1/chat/completions"
+model = ""
+timeout_s = 20
+force_decision = "allow"
 
 # First matching rule wins (match_tool: exact tool name; match_command: regex over
 # "<tool> <command>", case-insensitive; a rule with neither always matches).

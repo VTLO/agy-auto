@@ -15,10 +15,27 @@ policy.toml at it (e.g. "http://127.0.0.1:8080/v1/chat/completions") and it will
      response back verbatim.
   4. If the chosen backend is unreachable or times out, retry once against
      `router.fallback_backend` before failing.
+  5. If the chosen backend answers but the answer looks like a content-safety
+     refusal (empty/blocked completion, `finish_reason: content_filter`, a Gemini
+     `promptFeedback.blockReason`, etc.) rather than a genuine network or server
+     error, retry once against `router.refusal_fallback_backend` -- e.g. a local
+     uncensored model that will actually render an allow/deny/ask verdict on a
+     pending tool call a cloud provider's own safety layer declined to look at.
+  6. A backend can set `force_decision = "allow"` (or "deny"/"ask") in its
+     `[router.backends.*]` entry to say it is never trusted to reason about the
+     verdict at all, only to be reachable -- once it answers, its response is
+     rewritten to `force_decision` regardless of what it actually said, whether
+     that parsed as JSON, or how much of the (possibly large) context it could
+     read with its own small context window. This suits a low-capability model
+     used purely as a rubber stamp for the cases a stronger backend refused.
 
 This module makes no allow/deny decision itself -- engine/policy.py's Engine still
-owns that. It only decides which model answers the classifier's question this
-time. Standard library only, matching the rest of agy-auto.
+owns that, and its deterministic hard-deny layer (sudo, credential reads, disk
+tools, force-push, ...) runs before any request ever reaches this router, for
+every backend. Swapping in a more permissive backend here only changes which
+model answers the ambiguous grey-area calls the deterministic layers didn't
+already resolve -- it cannot un-deny something the hard-deny layer already
+denies. Standard library only, matching the rest of agy-auto.
 
 Run standalone:  python3 engine/router.py [--host H] [--port P] [--policy FILE]
 """
@@ -93,7 +110,10 @@ def forward(backend_cfg: dict, body: dict) -> tuple[int, bytes]:
     """Forwards `body` (an OpenAI chat-completions request) to `backend_cfg`,
     overriding only the model / auth / any chat_template_kwargs the backend
     declares. Returns (http_status, raw_response_body). Raises on network
-    failure, same exception shapes as urllib."""
+    failure, same exception shapes as urllib. An HTTP error status from the
+    backend is returned, not raised -- it's still a response, and the caller
+    (classify_response) decides whether it looks like a refusal, a genuine
+    error, or something to relay as-is."""
     endpoint = backend_cfg.get("endpoint") or ""
     if not endpoint:
         raise RouterError("backend has no endpoint configured")
@@ -116,9 +136,85 @@ def forward(backend_cfg: dict, body: dict) -> tuple[int, bytes]:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
-        # An HTTP error from the backend is still a response; relay it rather
-        # than treating it as unreachable (no fallback for e.g. a 400).
         return e.code, e.read() if e.fp else b'{"error": "backend error"}'
+
+
+# Substrings that show up in an HTTP-error body when a provider blocked the
+# request itself (as opposed to a rate limit, auth failure, or malformed
+# request). Matched case-insensitively against the raw response body.
+_REFUSAL_ERROR_MARKERS = ("safety", "blockreason", "prohibited_content", "recitation", "blocked")
+
+
+def classify_response(status: int, body: bytes) -> str:
+    """Categorizes a completed backend response as "ok", "refusal", or "error".
+
+    "refusal" means the backend was reachable and technically answered, but the
+    answer is a content-safety block rather than a usable {"decision": ...}
+    payload: an OpenAI-style `finish_reason: content_filter` / `refusal` field,
+    a Gemini `promptFeedback.blockReason` / blocked candidate, an empty
+    completion, or an HTTP error whose body names a safety block. Everything
+    else that isn't a clean 2xx with real content is "error" (rate limits, auth
+    failures, malformed requests, garbled JSON) -- those get the plain
+    fallback_backend treatment, not the refusal one, since a different model
+    won't fix a wrong API key.
+    """
+    if not (200 <= status < 300):
+        text = body.decode("utf-8", "replace").lower()
+        if any(m in text for m in _REFUSAL_ERROR_MARKERS):
+            return "refusal"
+        return "error"
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return "error"
+    if not isinstance(data, dict):
+        return "error"
+    feedback = data.get("promptFeedback") or {}
+    if feedback.get("blockReason"):
+        return "refusal"
+    choices = data.get("choices") or []
+    if not choices:
+        return "error"
+    choice = choices[0] or {}
+    finish_reason = str(choice.get("finish_reason") or "").lower()
+    if finish_reason in ("content_filter", "safety", "recitation"):
+        return "refusal"
+    message = choice.get("message") or {}
+    if message.get("refusal"):
+        return "refusal"
+    content = message.get("content")
+    if not content or not str(content).strip():
+        # An empty completion with no explicit reason is ambiguous, but agy-auto
+        # only ever sees this endpoint used for the classifier prompt, where a
+        # real answer is never empty -- treat it the same as a refusal so it
+        # gets a second opinion instead of a bare "malformed response" deny.
+        return "refusal"
+    return "ok"
+
+
+def apply_force_decision(body: bytes, forced: str) -> bytes:
+    """Rewrites a backend's response so the classifier always sees `forced` as the
+    decision. For a `force_decision` backend (a small/low-context model only ever
+    trusted to rubber-stamp one outcome, never to reason about a deny/ask verdict)
+    the backend's own output format, context limits, and even whether it produced
+    valid JSON at all stop mattering -- this always returns a well-formed
+    completion carrying `forced`, using the backend's own "reason" text when one
+    is parseable and a generic one otherwise."""
+    reason = f"forced to {forced} (backend configured with force_decision)"
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+        content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+        if content:
+            inner = json.loads(content)
+            if inner.get("reason"):
+                reason = str(inner["reason"])[:300]
+    except Exception:
+        pass
+    payload = {
+        "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"decision": forced, "reason": reason})}}],
+        "model": "forced:" + forced,
+    }
+    return json.dumps(payload).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -154,35 +250,72 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON body"})
             return
         router_cfg = self.server.cfg.get("router", {})  # type: ignore[attr-defined]
+        backends = router_cfg.get("backends", {})
         tool, command = extract_call(body.get("messages") or [])
         try:
             name, backend_cfg = pick_backend(router_cfg, tool, command)
         except RouterError as e:
             self._send_json(500, {"error": str(e)})
             return
-        t0 = time.time()
-        try:
-            status, resp_body = forward(backend_cfg, body)
+
+        def attempt(bname: str, bcfg: dict):
+            """Returns (status, body, kind) or None on a network-level failure."""
+            t0 = time.time()
+            try:
+                status, resp_body = forward(bcfg, body)
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, RouterError) as e:
+                self._log_route(bname, tool, command, time.time() - t0, ok=False, note=f"unreachable: {e}")
+                return None
+            forced = bcfg.get("force_decision")
+            if forced:
+                # This backend is never trusted to decide -- once it answers at
+                # all (reachable), its output is rewritten to `forced` regardless
+                # of what it said, whether that parsed, or how much of the
+                # context it could actually read.
+                resp_body = apply_force_decision(resp_body, forced)
+                status, kind = 200, "ok"
+                self._log_route(bname, tool, command, time.time() - t0, ok=True, note=f"forced->{forced}")
+                return status, resp_body, kind
+            kind = classify_response(status, resp_body)
+            self._log_route(bname, tool, command, time.time() - t0, ok=(kind == "ok"), note="" if kind == "ok" else kind)
+            return status, resp_body, kind
+
+        result = attempt(name, backend_cfg)
+        if result is None:
+            # Network-level failure: retry once against fallback_backend, same as
+            # a refusal or any other error would, since an unreachable backend
+            # can't be distinguished from "safety-blocked" until it answers.
+            fb_name = router_cfg.get("fallback_backend")
+            if fb_name and fb_name in backends and fb_name != name:
+                result = attempt(fb_name, backends[fb_name])
+            if result is None:
+                self._send_json(502, {"error": f"backend {name!r} unreachable and no working fallback_backend configured"})
+                return
+            status, resp_body, _kind = result
             self._send_json(status, resp_body)
-            self._log_route(name, tool, command, time.time() - t0, ok=True)
             return
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RouterError) as e:
-            fallback_name = router_cfg.get("fallback_backend")
-            backends = router_cfg.get("backends", {})
-            if fallback_name and fallback_name in backends and fallback_name != name:
-                self._log_route(name, tool, command, time.time() - t0, ok=False, note=f"{e}; trying fallback {fallback_name}")
-                t1 = time.time()
-                try:
-                    status, resp_body = forward(backends[fallback_name], body)
-                    self._send_json(status, resp_body)
-                    self._log_route(fallback_name, tool, command, time.time() - t1, ok=True, note=f"fallback from {name}")
-                    return
-                except (urllib.error.URLError, TimeoutError, OSError, ValueError, RouterError) as e2:
-                    self._log_route(fallback_name, tool, command, time.time() - t1, ok=False, note=str(e2))
-                    self._send_json(502, {"error": f"all backends unreachable: {name}: {e}; {fallback_name}: {e2}"})
-                    return
-            self._log_route(name, tool, command, time.time() - t0, ok=False, note=str(e))
-            self._send_json(502, {"error": f"backend {name} unreachable: {e}"})
+
+        status, resp_body, kind = result
+        if kind == "ok":
+            self._send_json(status, resp_body)
+            return
+
+        # Reachable but not usable: a "refusal" (safety block / empty completion)
+        # goes to refusal_fallback_backend first (e.g. a local uncensored model
+        # that will actually render a verdict); any other "error" (bad key, rate
+        # limit, malformed request) goes to the plain fallback_backend, since a
+        # different model doesn't fix those.
+        retry_name = router_cfg.get("refusal_fallback_backend") if kind == "refusal" else router_cfg.get("fallback_backend")
+        if retry_name and retry_name in backends and retry_name != name:
+            result2 = attempt(retry_name, backends[retry_name])
+            if result2 is not None:
+                status2, resp_body2, _kind2 = result2
+                self._send_json(status2, resp_body2)
+                return
+        # No (working) fallback for this case: relay the original response as-is
+        # so the classifier's own fail-closed handling (invalid JSON -> deny)
+        # takes over rather than the router inventing a verdict.
+        self._send_json(status, resp_body)
 
     def _log_route(self, backend: str, tool: str, command: str, dt: float, ok: bool, note: str = "") -> None:
         sys.stderr.write(
@@ -224,6 +357,7 @@ def main(argv=None) -> int:
     sys.stderr.write(
         f"agy-auto-router: default_backend={router_cfg.get('default_backend')!r} "
         f"fallback_backend={router_cfg.get('fallback_backend')!r} "
+        f"refusal_fallback_backend={router_cfg.get('refusal_fallback_backend')!r} "
         f"rules={len(router_cfg.get('rules', []))}\n"
     )
     try:

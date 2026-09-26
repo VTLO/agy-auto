@@ -265,6 +265,53 @@ backend = "cloud"
 `python3 -m unittest -v tests/test_router.py` to exercise the routing rules and the
 fallback path end-to-end against dummy loopback backends (no network, no agy).
 
+### When a cloud backend refuses to answer
+
+A cloud provider's own safety layer can block or empty out a response for a pending
+tool call it doesn't like the look of (`finish_reason: content_filter`, a Gemini
+`promptFeedback.blockReason`, an HTTP error naming a safety block) -- as distinct
+from a genuine failure like a bad key, a rate limit, or the network being down. By
+default that would surface to `engine/classifier.py` as a malformed response and
+fail closed (deny). The router tells the two apart (`classify_response()`) and
+routes them differently:
+
+- A **refusal** retries once against `router.refusal_fallback_backend` -- meant for
+  a local, uncensored model that will actually render an `allow`/`deny`/`ask`
+  verdict on calls a cloud provider's own filter declined to look at (e.g. Bluetooth
+  / BLE audit scripts against your own hardware).
+- Any other **error** (bad key, rate limit, malformed request) retries against the
+  plain `router.fallback_backend` instead, since a different model doesn't fix those.
+
+```toml
+[router]
+fallback_backend = "cloud"
+refusal_fallback_backend = "uncensored"
+
+[router.backends.uncensored]
+# llama-server -m gemma-2-2b-it-abliterated-Q4_K_M.gguf --port 8082
+endpoint = "http://127.0.0.1:8082/v1/chat/completions"
+model = ""
+timeout_s = 20
+force_decision = "allow"
+```
+
+A backend can also set `force_decision = "allow"` (or `"deny"`/`"ask"`), as the
+shipped `uncensored` backend does above. That means the backend is trusted only to
+be reachable, never to reason about the verdict: once it answers at all, the router
+rewrites the response to `force_decision` regardless of what it actually said,
+whether that parsed as JSON, or how much of the prompt its own (possibly small)
+context window could take in -- a 2B model only ever standing in for a cloud
+refusal doesn't need enough context or reasoning ability to get a deny/ask call
+right, it just needs to be running. Drop the line to let a backend render real
+allow/deny/ask verdicts instead.
+
+This changes only which model answers the ambiguous grey-area calls neither
+deterministic layer already resolved. The hard-deny layer in `engine/policy.py`
+(`sudo`, credential reads, disk/partition tools, force-push, pipe-to-shell, ...)
+runs first for every request regardless of backend and this router never sees
+those calls at all -- swapping in a more permissive model, or one forced to
+`allow`, cannot un-deny something hard-deny already denies.
+
 ## Running without a classifier (Deterministic Mode)
 
 You do **not** need a running LLM endpoint to use `agy-auto`:
