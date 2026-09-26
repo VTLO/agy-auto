@@ -222,12 +222,31 @@ python3 engine/router.py                     # listens on 127.0.0.1:8080 by defa
 python3 engine/router.py --host 0.0.0.0 --port 8888
 ```
 
+Or use `./install-router.sh` instead of running it by hand: it registers the router
+as a background service (auto-detecting `systemctl --user`, then Termux's
+`termux-services`, then falling back to a plain `nohup` process), patches
+`[classifier].endpoint` in your policy overlay to point at it, and reports whether
+each configured `[router.backends.*]` entry is actually reachable:
+
+```bash
+./install-router.sh                 # install + start the service, patch policy.toml
+./install-router.sh --status        # running?, /healthz, per-backend reachability
+./install-router.sh --restart
+./install-router.sh --uninstall     # stop and remove the service; policy.toml is left as-is
+./install-router.sh --host 0.0.0.0 --port 8888 --systemd   # override detection/port
+```
+
+It's a companion to `install.sh` (which registers the PreToolUse hook itself) --
+run either one first, in either order, and re-running either is safe.
+
 Then point the classifier at it in `~/.gemini/config/agy-auto/policy.toml`:
 
 ```toml
 [classifier]
 endpoint = "http://127.0.0.1:8080/v1/chat/completions"
 ```
+
+(`install-router.sh` does this step for you.)
 
 Configure the backends and routing rules under `[router]` (shipped defaults are in
 `policy/default.toml`, mergeable the same way as any other policy layer):
